@@ -6,7 +6,7 @@ GitHub
 
 ## Step-by-step approach
 
-ECS Fargate 성능 측정하기 - 구축부터 Benchmark까지 (상) | dealicious-inc.github.io
+ECS Fargate 
 
 1. Keep your existing application image
 
