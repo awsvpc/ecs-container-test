@@ -1423,3 +1423,1260 @@ Before approving deployment, review the generated diff. The patcher should add t
 - If deployment fails, inspect ECS service events and stopped-task reasons. A successful registration does not guarantee that Fargate can start the patched task.
 - The script intentionally leaves the registered revision in place if you decline the second approval. It does not automatically roll back a deployment after an application or sensor health failure.
 - The final validation confirms ECS container state, not successful Falcon telemetry. Check the Falcon console to verify the sensor is actually reporting.
+
+## Key concepts
+
+Let's break this down from the beginning, assuming you're new to ECS. The goal is to understand what the script does, why each step is necessary, and how CrowdStrike gets added to an existing NGINX application without rebuilding the NGINX image.
+
+# 1. First, understand what we're changing
+
+Imagine you already have an NGINX web server running in AWS. Your application is packaged as a Docker image and stored in ECR. ECS Fargate runs that image for you.
+
+## Before CrowdStrike
+
+ECR — Container image registry
+
+Stores your NGINX Docker image
+
+ECS task definition
+
+Instructions for running NGINX
+
+ECS Fargate task
+
+NGINX container
+
+Your application runs here
+
+After the CrowdStrike integration, the original NGINX image remains in ECR. The task definition is modified so that the Falcon sensor can be injected when the task starts.
+
+## After CrowdStrike patching
+
+ECR
+
+Existing NGINX image + Falcon sensor image
+
+Patched ECS task definition
+
+NGINX configuration + Falcon initialization container
+
+ECS Fargate task
+
+Falcon initialization container
+
+Prepares the sensor injection
+
+NGINX container
+
+Runs with the injected sensor setup
+
+The Falcon initialization container is not necessarily a permanently running monitoring sidecar. In the documented patching approach, it prepares the application container for sensor injection.
+
+# 2. Key ECS terms in simple English
+
+| Term | Simple meaning |
+| --- | --- |
+| Docker image | A packaged application, like NGINX, ready to run. |
+| Container | A running instance of an image. |
+| ECR | AWS storage for Docker images. Think of it as a container image library. |
+| ECS | AWS service that manages your containers. |
+| Fargate | AWS runs the underlying compute infrastructure, so you don't manage EC2 servers. |
+| ECS cluster | A logical group where your ECS services and tasks run. |
+| Task definition | A recipe describing the images, CPU, memory, ports, roles, and settings needed to run a task. |
+| Task | One running instance of a task definition. |
+| Service | Keeps the desired number of tasks running and replaces unhealthy tasks. |
+| Task revision | A numbered version of a task definition, such as `nginx-app:4` or `nginx-app:5`. |
+| Falcon CID | Your CrowdStrike customer identifier, generally including the checksum supplied by Falcon. |
+| Patcher | A utility that modifies the task-definition JSON to prepare it for Falcon sensor injection. |
+| IAM role | Permissions that allow AWS services or containers to access other AWS resources. |
+| Deployment approval | Your confirmation before a change is registered or deployed. |
+
+The most important distinction to remember is:
+
+ECR stores the image. The task definition describes how to run it. The service keeps the desired number of tasks running.
+
+# 3. The complete workflow
+
+Here is the process your script follows, from your laptop to AWS.
+
+1. Check your laptop
+   The script checks that AWS CLI, Docker, and `jq` are installed. Docker must be running.
+2. Ask for configuration
+   You enter the AWS region, ECS cluster, ECS service, Falcon CID, and Falcon image URI.
+3. Verify AWS access
+   The script calls AWS STS to check which AWS identity you are using and confirms that you can authenticate.
+4. Download the current task definition
+   It asks ECS which task definition the existing service uses, then retrieves that definition as JSON.
+5. Create a backup
+   It saves the original definition before making any changes.
+6. Run the CrowdStrike patcher locally
+   Docker runs the Falcon patcher image against the task-definition JSON. The patcher produces a modified JSON file.
+7. Validate and review
+   The script checks the JSON and displays a diff showing the differences between the original and patched definitions.
+8. Approve task registration
+   If you type `YES`, AWS registers the patched task definition as a new revision.
+9. Approve service deployment
+   If you type `YES` again, the ECS service is updated to use the new revision.
+10. Wait and verify
+    The script waits for ECS to stabilize, checks the running task, and verifies that the expected containers appear.
+
+The two approvals serve different purposes: the first creates a new task-definition revision in AWS; the second actually changes the task definition used by your service.
+
+# 4. Explaining the script section by section
+
+## Step 1 — Check prerequisites
+
+bash
+
+```
+for cmd in aws docker jq diff base64; do
+  command -v "$cmd" >/dev/null 2>&1 ||
+    die "Missing prerequisite: $cmd"
+done
+```
+
+This checks whether the required command-line tools exist.
+
+- `aws`: communicates with AWS.
+- `docker`: runs the Falcon patcher image.
+- `jq`: reads and modifies JSON.
+- `diff`: compares the original and patched files.
+- `base64`: encodes ECR authentication data.
+
+If a tool is missing, the script stops instead of failing halfway through the deployment.
+
+## Step 2 — Ask for input
+
+bash
+
+```
+read -r -p "AWS region: " AWS_REGION
+read -r -p "ECS cluster: " ECS_CLUSTER
+read -r -p "ECS service: " ECS_SERVICE
+```
+
+These values tell the script which AWS resources to work with.
+
+For example:
+
+text
+
+```
+AWS region: us-east-1
+ECS cluster: dev-cluster
+ECS service: nginx-service
+Falcon CID: your-CID-with-checksum
+Falcon image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/falcon:version
+```
+
+The script doesn't create a new cluster or service. It targets the existing service you specify.
+
+## Step 3 — Check AWS identity
+
+bash
+
+```
+aws sts get-caller-identity --region "$AWS_REGION"
+```
+
+AWS STS tells you which account and IAM identity your CLI is using.
+
+This is important because you might have access to several AWS accounts, such as development, staging, and production.
+
+Successful authentication doesn't automatically mean you have all the permissions needed. You also need the appropriate ECS and ECR permissions.
+
+## Step 4 — Retrieve the task definition
+
+bash
+
+```
+CURRENT_TASK_ARN=$(aws ecs describe-services \
+  --cluster "$ECS_CLUSTER" \
+  --services "$ECS_SERVICE" \
+  --region "$AWS_REGION" \
+  --query 'services[0].taskDefinition' \
+  --output text)
+```
+
+Think of the service as saying:
+
+> "I am currently using task definition revision 7."
+
+The script retrieves that task definition and saves its configuration.
+
+It then removes AWS-generated fields:
+
+bash
+
+```
+jq 'del(
+  .taskDefinitionArn,
+  .requiresAttributes,
+  .status,
+  .revision,
+  .compatibilities,
+  .registeredAt,
+  .registeredBy,
+  .deregisteredAt,
+  .tags
+)' original-full.json
+```
+
+Why?
+
+When you retrieve a task definition from AWS, the response includes metadata AWS generated when it registered the definition. Some of these fields must not be sent back as input when registering a new revision.
+
+The script removes that metadata while retaining the application configuration.
+
+## Step 5 — Create the backup
+
+The script creates a timestamped directory such as:
+
+text
+
+```
+ecs-falcon-backup-20261027-153000/
+├── original-full.json
+├── taskdefinition.json
+└── taskdefinitionwithfalcon.json
+```
+
+Each file has a purpose:
+
+- `original-full.json`: the complete response retrieved from AWS.
+- `taskdefinition.json`: the cleaned definition that will be passed to the patcher.
+- `taskdefinitionwithfalcon.json`: the patched output.
+
+This lets you inspect the original configuration and understand exactly what changed.
+
+## Step 6 — Authenticate to ECR
+
+ECR repositories can be private, meaning Docker needs authentication to pull images.
+
+bash
+
+```
+aws ecr get-login-password --region "$registry_region"
+```
+
+This requests an ECR authorization token using your AWS credentials.
+
+The script encodes the authentication data and passes it to the patcher.
+
+Important: The script's pull-token handling assumes the patcher's documented `-pulltoken` option accepts the encoded Docker authentication configuration. Verify this against the exact patcher version you use. The token is temporary, but it should still be treated as a secret.
+
+## Step 7 — Run the patcher
+
+The central command is:
+
+bash
+
+```
+docker run --rm --pull=never \
+  -v "$PWD/$BACKUP_DIR:/var/run/spec" \
+  "$FALCON_IMAGE_URI" \
+  -cid "$FALCON_CID" \
+  -image "$FALCON_IMAGE_URI" \
+  -pulltoken "$PULL_TOKEN" \
+  -ecs-spec-file /var/run/spec/taskdefinition.json \
+  > "$BACKUP_DIR/taskdefinitionwithfalcon.json"
+```
+
+Let's break it down.
+
+| Command or option | Meaning |
+| --- | --- |
+| `docker run` | Starts a container to execute the patcher. |
+| `--rm` | Removes the patcher container after it exits. |
+| `--pull=never` | Uses the image already present locally instead of pulling it. |
+| `-v` | Makes your local backup directory accessible inside the patcher container. |
+| `-cid` | Supplies your Falcon customer identifier. |
+| `-image` | Identifies the Falcon sensor image used by the patcher. |
+| `-pulltoken` | Supplies authentication data so the patcher can inspect private images. |
+| `-ecs-spec-file` | Points the patcher at the original task-definition JSON. |
+| `>` | Saves the patcher's output to a new JSON file. |
+
+Notice that the script runs the patcher on your laptop. It does not immediately change the ECS service.
+
+The patcher is preparing the task definition, not directly installing software on your laptop or rebuilding NGINX.
+
+## Step 8 — Validate the patched definition
+
+The script checks whether the output is valid JSON, whether it still describes a Fargate task definition, and whether the expected Falcon initialization container exists.
+
+It also checks for `SYS_PTRACE`.
+
+In simple terms, `SYS_PTRACE` is a Linux capability related to process inspection and debugging. The documented sensor-injection method requires it for the relevant application container configuration.
+
+These checks are useful, but they don't prove the sensor will start successfully. That's why the script also performs deployment validation.
+
+## Step 9 — Review the diff
+
+bash
+
+```
+diff -u original.json taskdefinitionwithfalcon.json
+```
+
+A diff shows what changed between two files.
+
+For example, the output might show:
+
+diff
+
+```
++ "name": "crowdstrike-falcon-init-container"
+```
+
+or a change to the NGINX container's entry point.
+
+The exact output depends on your task definition and the patcher version.
+
+Review this output carefully. If the patcher unexpectedly removes environment variables, secrets, port mappings, health checks, or other settings, do not proceed until you understand why.
+
+## Step 10 — Register the new revision
+
+bash
+
+```
+aws ecs register-task-definition \
+  --cli-input-json file://taskdefinitionwithfalcon.json \
+  --region "$AWS_REGION"
+```
+
+AWS registers the patched JSON as a new task-definition revision.
+
+For example:
+
+text
+
+```
+Before: nginx-app:7
+After:  nginx-app:8
+```
+
+Revision 8 exists in ECS, but the service is still using revision 7 at this point.
+
+This is an important safety boundary.
+
+## Step 11 — Update the ECS service
+
+bash
+
+```
+aws ecs update-service \
+  --cluster "$ECS_CLUSTER" \
+  --service "$ECS_SERVICE" \
+  --task-definition "$NEW_TASK_ARN" \
+  --region "$AWS_REGION"
+```
+
+This tells ECS:
+
+> "Use the new task definition for this service."
+
+ECS then starts replacing old tasks with tasks created from the new revision, following its deployment configuration.
+
+Your existing service name and cluster remain the same.
+
+## Step 12 — Wait for stability and validate
+
+bash
+
+```
+aws ecs wait services-stable \
+  --cluster "$ECS_CLUSTER" \
+  --services "$ECS_SERVICE" \
+  --region "$AWS_REGION"
+```
+
+The script waits for ECS to report the service as stable.
+
+It then checks the running tasks and looks for NGINX and the Falcon initialization container.
+
+Remember, a stable ECS service does not prove CrowdStrike is reporting telemetry. You must separately confirm sensor health in the Falcon console.
+
+# 5. What happens if something fails?
+
+| Failure | What it means | What to check |
+| --- | --- | --- |
+| AWS identity check fails | Your CLI can't authenticate. | AWS profile, credentials, SSO session, region. |
+| Falcon image not found locally | Docker can't find the exact image tag. | Run `docker image ls` and check the image URI. |
+| Patcher fails | The patcher couldn't process the task definition or access an image. | Docker output, pull token, image compatibility, patcher arguments. |
+| Registration fails | AWS rejected the task-definition JSON or your permissions. | AWS error message and JSON validation. |
+| Service deployment fails | ECS couldn't successfully deploy the new revision. | ECS service events, stopped task reasons, CloudWatch logs. |
+| Service is stable but Falcon is absent | ECS is running, but the sensor may not be healthy or reporting. | Sensor initialization logs and the Falcon console. |
+
+The script deliberately does not automatically roll back a failed deployment. If a new revision is deployed and the application fails, you should inspect the service events and explicitly restore the previous task-definition revision if needed.
+
+# 6. Five concepts to remember
+
+- The patcher runs locally. It creates a modified task-definition JSON file.
+- Registering a revision is not the same as deploying it. The service changes only when you update it.
+- ECR images and task definitions are different things. This workflow changes the task definition, not the NGINX image itself.
+- The backup is your reference point. Always keep it and review the diff.
+- ECS health and Falcon health are different. Confirm both the application and the sensor are working.
+
+One final caveat: the script is a useful test harness, but the archived CrowdStrike patcher is unsupported. In particular, the validation logic and authentication options should be checked against the exact version you intend to run before using it on even a shared development service.
+
+## Operational Tasks
+
+# CrowdStrike on ECS Fargate: operational guide
+
+Once the initial test works, the next step is understanding what CrowdStrike adds to your ECS task definition, how to maintain the sensor over time, and how to verify it is actually working inside a running container.
+
+I'll organize this into four parts:
+
+1. New CrowdStrike terminology and task-definition changes.
+2. Operational maintenance responsibilities and update frequency.
+3. A script to automate image and patcher maintenance checks.
+4. Validation of a running ECS task.
+
+The key principle is that maintaining the Falcon sensor image, maintaining the patching utility, and deploying a new ECS task definition are three separate activities. Updating one does not automatically update the others.
+
+## 1. New CrowdStrike terminology
+
+These terms come from the archived [CrowdStrike ECS Fargate guide](<https://github.com/CrowdStrike/Container-Security/blob/main/aws-ecs/ecs-fargate-guide.md?utm_source=chatgpt.com>). The guide says the sensor runs inside each application container, using user-space instrumentation rather than a kernel sensor on the Fargate host. It also explicitly states that the open-source implementation is unsupported.
+
+GitHub
+
++1
+
+| Term | What it means operationally |
+| --- | --- |
+| `-ecs-spec-file` | The path to the input ECS task-definition JSON file inside the patcher container. |
+| `-ecs-spec` | An alternative patcher input option for passing a task definition through standard input. |
+| `-cid` | The Falcon customer ID, including the checksum where required. It tells the sensor which Falcon customer environment to report to. |
+| `-image` | The sensor image reference that the patched task definition will use. |
+| `-pulltoken` | Temporary registry authentication data used by the patcher to inspect private application images and discover their entry points or commands. |
+| `SYS_PTRACE` | A Linux capability the documented approach adds to application containers so the sensor can inspect processes. |
+| Falcon initialization container | A container that prepares the sensor files and shared storage before the application starts. |
+| Sensor injection | The process of making the sensor run inside the application container without rebuilding the original application image. |
+| Falcon sensor image | The container image containing the sensor and the patching utility. |
+| Falcon registry credentials | Credentials used to authenticate to CrowdStrike's private container registry and obtain sensor images. |
+
+### What exactly is `-ecs-spec-file`?
+
+Imagine your existing task definition is saved on your laptop:
+
+text
+
+```
+taskdefinition.json
+```
+
+The script mounts the local directory into Docker:
+
+bash
+
+```
+-v "$PWD:/var/run/spec"
+```
+
+Inside the patcher container, the file is accessible at:
+
+text
+
+```
+/var/run/spec/taskdefinition.json
+```
+
+Then this argument tells the patcher where to find it:
+
+bash
+
+```
+-ecs-spec-file /var/run/spec/taskdefinition.json
+```
+
+The patcher reads that file and generates a modified task definition. It doesn't directly edit your ECS service.
+
+### What is `SYS_PTRACE`?
+
+Think of it as a permission that allows the sensor to inspect processes inside the application container.
+
+The patcher adds this capability to the relevant container definitions. It is a security-sensitive permission, so you should review the change and follow your organization's container hardening policy.
+
+### What changes should you see in the patched task definition?
+
+The exact JSON depends on your existing task definition and patcher version. The documented approach generally changes these areas:
+
+- An additional initialization container: `crowdstrike-falcon-init-container`.
+- Shared storage: a volume and mounts used to make the sensor files available to application containers.
+- Application entry points: the sensor entry point wraps the original application startup sequence.
+- Linux capabilities: `SYS_PTRACE` is added to application containers.
+- Sensor image reference and CID: the initialization configuration identifies the sensor image and customer.
+
+One important detail: the initialization container may exit after preparing the sensor. Don't expect it to be a permanently running monitoring container. The sensor itself runs inside each instrumented application container.
+
+GitHub
+
+## 2. What needs regular maintenance?
+
+There are four separate things to manage.
+
+A. Falcon sensor image
+
+Monitor vendor releasesCheck for new supported sensor releases, security fixes, and compatibility changes. Pull the approved version into ECR, test it, and deploy a new task-definition revision when appropriate.
+
+B. Patching utility
+
+Review with every sensor upgradeThe patcher is bundled in the sensor image in the documented approach. Updating the image used to run the patcher also updates the patcher version used for that run. Keep a record of which patcher/sensor version generated each deployed task definition.
+
+C. Registry credentials and tokens
+
+Refresh for each runECR authorization tokens are short-lived. Generate fresh tokens each time the patcher needs private image access. Keep CrowdStrike API credentials in a secret manager, not in the script or source control.
+
+D. Running tasks and sensor health
+
+After every deploymentCheck ECS service stability, container startup, logs, and sensor telemetry in Falcon. Also perform periodic checks that running tasks are still using the expected task-definition revision.
+
+These are recommended operational practices, not official CrowdStrike maintenance intervals.
+
+### Suggested maintenance schedule
+
+| Frequency | Activity |
+| --- | --- |
+| Each deployment | Validate the patched JSON and review its diff. |
+| After each sensor upgrade | Test NGINX startup, ECS health, and Falcon telemetry. |
+| Weekly | Check for vendor advisories, new sensor releases, and failed ECS tasks. |
+| Monthly | Review deployed sensor versions, ECR image retention, IAM access, and the rollback procedure. |
+| After a critical advisory | Assess urgency and deploy the approved fix according to your incident/change process. |
+
+The patcher's ECR pull token needs to be refreshed much more frequently than the sensor image itself. The archived guide specifically warns that ECR credentials expire and need periodic renewal.
+
+GitHub
+
+## 3. Operational automation script
+
+This script is intended for routine sensor upgrades in a lower environment. It:
+
+1. Uses an explicitly selected, version-pinned Falcon image already mirrored into ECR and available locally.
+2. Retrieves the existing ECS task definition and backs it up.
+3. Runs the patcher with fresh ECR credentials.
+4. Shows the diff and asks for approval.
+5. Registers a new task-definition revision and asks for deployment approval.
+6. Waits for service stability.
+7. Uses ECS Exec to inspect the sensor in a running NGINX container.
+
+It deliberately does not choose an unreviewed latest sensor release automatically. Your team should approve the sensor version before using it.
+
+### `maintain-falcon-ecs.sh`
+
+bash
+
+```
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+approve() {
+  local answer
+  read -r -p "$1 Type YES: " answer
+  [[ "$answer" == "YES" ]]
+}
+
+for cmd in aws docker jq diff base64; do
+  command -v "$cmd" >/dev/null || die "Install $cmd first"
+done
+
+docker info >/dev/null 2>&1 || die "Docker is not running"
+
+read -r -p "AWS region: " AWS_REGION
+read -r -p "ECS cluster: " CLUSTER
+read -r -p "ECS service: " SERVICE
+read -r -p "Approved Falcon image URI (version-pinned ECR URI): " FALCON_IMAGE
+read -r -p "Falcon CID: " FALCON_CID
+
+[[ -n "$AWS_REGION" && -n "$CLUSTER" &&
+   -n "$SERVICE" && -n "$FALCON_IMAGE" &&
+   -n "$FALCON_CID" ]] || die "All values are required"
+
+docker image inspect "$FALCON_IMAGE" >/dev/null 2>&1 ||
+  die "Approved Falcon image is not present locally"
+
+aws sts get-caller-identity --region "$AWS_REGION" ||
+  die "AWS authentication failed"
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+WORKDIR="./falcon-maintenance-$STAMP"
+mkdir -m 700 "$WORKDIR"
+
+echo "Retrieving current service..."
+aws ecs describe-services \
+  --cluster "$CLUSTER" \
+  --services "$SERVICE" \
+  --region "$AWS_REGION" > "$WORKDIR/service.json"
+
+[[ "$(jq -r '.services | length' "$WORKDIR/service.json")" == "1" ]] ||
+  die "Service not found"
+
+[[ "$(jq -r '.services[0].status' "$WORKDIR/service.json")" == "ACTIVE" ]] ||
+  die "Service is not ACTIVE"
+
+OLD_TASK=$(jq -r '.services[0].taskDefinition' "$WORKDIR/service.json")
+
+aws ecs describe-task-definition \
+  --task-definition "$OLD_TASK" \
+  --region "$AWS_REGION" \
+  --query taskDefinition > "$WORKDIR/original-full.json"
+
+jq 'del(
+  .taskDefinitionArn, .revision, .status,
+  .requiresAttributes, .compatibilities,
+  .registeredAt, .registeredBy, .deregisteredAt,
+  .tags
+)' "$WORKDIR/original-full.json" > "$WORKDIR/input.json"
+
+jq -e '
+  (.requiresCompatibilities | index("FARGATE") != null) and
+  any(.containerDefinitions[];
+    ((.name // "") + " " + (.image // "") | ascii_downcase)
+    | contains("nginx"))
+' "$WORKDIR/input.json" >/dev/null ||
+  die "Expected an NGINX Fargate task definition"
+
+jq -e '
+  any(.containerDefinitions[];
+    .name == "crowdstrike-falcon-init-container")
+' "$WORKDIR/input.json" >/dev/null &&
+  die "Task definition already appears patched; review before proceeding"
+
+# Build an ECR pull token for all private ECR registries referenced
+# by this task definition and the Falcon image.
+mapfile -t REGISTRIES < <(
+  {
+    printf '%s\n' "$FALCON_IMAGE"
+    jq -r '.containerDefinitions[].image' "$WORKDIR/input.json"
+  } |
+  while IFS= read -r image; do
+    registry="${image%%/*}"
+    [[ "$registry" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com$ ]] &&
+      printf '%s\n' "$registry"
+  done | sort -u
+)
+
+AUTH_CONFIG='{"auths":{}}'
+
+for registry in "${REGISTRIES[@]}"; do
+  registry_region="${registry#*.dkr.ecr.}"
+  registry_region="${registry_region%.amazonaws.com}"
+
+  password=$(aws ecr get-login-password --region "$registry_region") ||
+    die "Cannot get ECR token for $registry"
+
+  auth=$(printf 'AWS:%s' "$password" | base64 | tr -d '\r\n')
+  unset password
+
+  AUTH_CONFIG=$(jq -c \
+    --arg registry "$registry" \
+    --arg auth "$auth" \
+    '.auths[$registry] = {"auth": $auth}' <<<"$AUTH_CONFIG")
+  unset auth
+done
+
+PULL_TOKEN=$(printf '%s' "$AUTH_CONFIG" | base64 | tr -d '\r\n')
+unset AUTH_CONFIG
+
+echo "Running the patcher..."
+docker run --rm --pull=never \
+  -v "$PWD/$WORKDIR:/var/run/spec" \
+  "$FALCON_IMAGE" \
+  -cid "$FALCON_CID" \
+  -image "$FALCON_IMAGE" \
+  -pulltoken "$PULL_TOKEN" \
+  -ecs-spec-file /var/run/spec/input.json \
+  > "$WORKDIR/patched.json"
+
+unset PULL_TOKEN
+
+jq -e '
+  (.containerDefinitions | type == "array") and
+  any(.containerDefinitions[];
+    .name == "crowdstrike-falcon-init-container")
+' "$WORKDIR/patched.json" >/dev/null ||
+  die "Patched definition failed validation"
+
+echo
+echo "Changes to review:"
+diff -u "$WORKDIR/input.json" "$WORKDIR/patched.json" || true
+
+echo
+echo "Backup: $WORKDIR"
+approve "Register the patched task definition?" ||
+  die "Cancelled before registration"
+
+NEW_TASK=$(aws ecs register-task-definition \
+  --cli-input-json "file://$WORKDIR/patched.json" \
+  --region "$AWS_REGION" \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text)
+
+echo "Registered revision: $NEW_TASK"
+
+approve "Deploy this revision to $SERVICE?" || {
+  echo "Service unchanged; revision $NEW_TASK remains registered"
+  exit 0
+}
+
+# Protect against overwriting a deployment made since inspection.
+CURRENT=$(aws ecs describe-services \
+  --cluster "$CLUSTER" --services "$SERVICE" \
+  --region "$AWS_REGION" \
+  --query 'services[0].taskDefinition' --output text)
+
+[[ "$CURRENT" == "$OLD_TASK" ]] ||
+  die "Service changed since inspection; refusing to overwrite it"
+
+aws ecs update-service \
+  --cluster "$CLUSTER" \
+  --service "$SERVICE" \
+  --task-definition "$NEW_TASK" \
+  --region "$AWS_REGION" >/dev/null
+
+echo "Waiting for service stability..."
+aws ecs wait services-stable \
+  --cluster "$CLUSTER" --services "$SERVICE" \
+  --region "$AWS_REGION" ||
+  die "Service did not stabilize; inspect ECS events"
+
+FINAL_TASK=$(aws ecs describe-services \
+  --cluster "$CLUSTER" --services "$SERVICE" \
+  --region "$AWS_REGION" \
+  --query 'services[0].taskDefinition' --output text)
+
+[[ "$FINAL_TASK" == "$NEW_TASK" ]] ||
+  die "Service is not using the new task definition"
+
+TASK_ARN=$(aws ecs list-tasks \
+  --cluster "$CLUSTER" --service-name "$SERVICE" \
+  --desired-status RUNNING --region "$AWS_REGION" \
+  --query 'taskArns[0]' --output text)
+
+[[ "$TASK_ARN" == arn:* ]] || die "No running task found"
+
+TASK_JSON=$(aws ecs describe-tasks \
+  --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+  --region "$AWS_REGION")
+
+# Find the actual application container name.
+APP_CONTAINER=$(jq -r '
+  [.tasks[0].containers[]
+   | select((.name + " " + .image | ascii_downcase) | contains("nginx"))
+   | .name][0] // empty
+' <<<"$TASK_JSON")
+
+[[ -n "$APP_CONTAINER" ]] || die "NGINX container not found"
+
+echo
+echo "Deployment succeeded."
+echo "Task: $TASK_ARN"
+echo "NGINX container: $APP_CONTAINER"
+echo "Next: validate sensor processes with ECS Exec."
+echo
+echo "ECS Exec must be enabled and SSM permissions/network access configured."
+echo "Run the validation command in the next section."
+```
+
+Run it:
+
+bash
+
+```
+chmod 700 maintain-falcon-ecs.sh
+./maintain-falcon-ecs.sh
+```
+
+Scope of this script: It automates the task-definition patch and deployment using an already approved image. It does not download a new sensor release from CrowdStrike. Image acquisition and publishing to ECR should be a separate controlled step, so a new release is not deployed merely because a new tag exists.
+
+Also, this script assumes the patcher's `-pulltoken` format matches the version you are running and that private application images are accessible with the generated ECR credentials. Test these assumptions in development before adopting it for routine maintenance.
+
+## 4. Refresh the Falcon sensor image in ECR
+
+Before running the maintenance script, update the image in a controlled process.
+
+The documented flow is:
+
+1. Obtain the approved sensor version from CrowdStrike.
+2. Authenticate to CrowdStrike's container registry.
+3. Pull the approved sensor image.
+4. Tag it for your ECR repository.
+5. Push it to ECR.
+6. Run `maintain-falcon-ecs.sh` using that exact versioned ECR image URI.
+
+For example, after obtaining an approved upstream sensor tag:
+
+bash
+
+```
+export AWS_REGION="us-east-1"
+export ACCOUNT_ID="123456789012"
+export SENSOR_TAG="YOUR_APPROVED_SENSOR_VERSION"
+
+export ECR_IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/falcon-sensor:${SENSOR_TAG}"
+
+# Log in to the CrowdStrike registry first using credentials
+# obtained through your approved CrowdStrike API workflow.
+docker login registry.crowdstrike.com
+
+# Pull the approved upstream sensor image.
+docker pull \
+  "registry.crowdstrike.com/falcon-container/us-2/release/falcon-sensor:${SENSOR_TAG}"
+
+# Log in to ECR.
+aws ecr get-login-password --region "$AWS_REGION" |
+  docker login \
+    --username AWS \
+    --password-stdin \
+    "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+# Tag and publish the image to ECR.
+docker tag \
+  "registry.crowdstrike.com/falcon-container/us-2/release/falcon-sensor:${SENSOR_TAG}" \
+  "$ECR_IMAGE"
+
+docker push "$ECR_IMAGE"
+```
+
+Replace `us-2` with the appropriate CrowdStrike cloud region for your Falcon account. The example assumes the destination ECR repository already exists and your AWS identity has push permissions.
+
+Use the version returned by CrowdStrike's approved release process; do not assume that the last entry in a registry tag list is always the newest compatible version. The archived guide describes the registry authentication and mirroring process.
+
+GitHub
+
+Once pushed, the next deployment should use the new versioned URI, for example:
+
+text
+
+```
+123456789012.dkr.ecr.us-east-1.amazonaws.com/falcon-sensor:YOUR_APPROVED_SENSOR_VERSION
+```
+
+A push to ECR alone does not update running tasks. The task definition must be patched with the new URI, registered, and deployed.
+
+## 5. Validate Falcon from a running ECS container
+
+ECS service stability is necessary but not sufficient. You also need to inspect the application container and confirm that the sensor is running.
+
+### Step A — Enable ECS Exec
+
+ECS Exec lets you run commands inside a running container. It must be enabled for the service, and your IAM identity, task execution environment, and networking must support it.
+
+For a development service, you can enable it with:
+
+bash
+
+```
+aws ecs update-service \
+  --cluster dev-cluster \
+  --service nginx-service \
+  --enable-execute-command \
+  --region us-east-1
+```
+
+This setting alone does not guarantee ECS Exec will work for already-running tasks; you may need to redeploy them. Review the [AWS ECS Exec prerequisites](<https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html?utm_source=chatgpt.com>).
+
+### Step B — Find the running task
+
+bash
+
+```
+aws ecs list-tasks \
+  --cluster dev-cluster \
+  --service-name nginx-service \
+  --desired-status RUNNING \
+  --region us-east-1
+```
+
+Copy one task ARN from the output.
+
+Then identify the application container name:
+
+bash
+
+```
+aws ecs describe-tasks \
+  --cluster dev-cluster \
+  --tasks "YOUR_TASK_ARN" \
+  --region us-east-1 \
+  --query 'tasks[0].containers[*].{name:name,status:lastStatus,image:image}'
+```
+
+Use the actual NGINX application container name, not the initialization container.
+
+### Step C — Inspect processes inside NGINX
+
+bash
+
+```
+aws ecs execute-command \
+  --cluster dev-cluster \
+  --task "YOUR_TASK_ARN" \
+  --container nginx \
+  --interactive \
+  --command "/bin/sh"
+```
+
+Replace `nginx` with the actual application container name.
+
+Inside the shell, try:
+
+sh
+
+```
+ps -ef
+```
+
+If the container has a compatible process-listing utility, filter for Falcon-related processes:
+
+sh
+
+```
+ps -ef | grep -i '[f]alcon'
+```
+
+You can also inspect likely sensor-related files and directories if you know the paths used by your approved sensor version.
+
+Not all NGINX images include `ps`, `grep`, or other diagnostic utilities. A minimal or distroless image may need a different supported verification method.
+
+### Step D — Verify the sensor itself
+
+Use these three independent checks:
+
+| Check | What it proves |
+| --- | --- |
+| ECS task and service health | The task started and the service is stable. |
+| Process inspection and sensor logs | Evidence that the sensor was initialized and is running inside the application container. |
+| Falcon console telemetry | Evidence that the sensor is communicating with CrowdStrike and reporting as expected. |
+
+The last check is essential. Finding a Falcon-related process is useful, but it does not prove that the sensor is healthy or successfully sending telemetry.
+
+## 6. Operational checklist
+
+Use this checklist for each sensor upgrade:
+
+## Sensor upgrade checklist
+
+0 of 8
+
+[ ]Confirm the new sensor version is approved by security.
+
+[ ]Mirror the versioned sensor image into ECR.
+
+[ ]Run the patcher using the new ECR image and fresh registry tokens.
+
+[ ]Review the task-definition diff and preserve required application settings.
+
+[ ]Register and deploy the new revision to development.
+
+[ ]Confirm NGINX and ECS service health.
+
+[ ]Inspect sensor status and confirm telemetry in Falcon.
+
+[ ]Record the deployed sensor version and rollback revision.
+
+My recommendation is to separate image publishing from deployment. First publish a pinned sensor image to ECR, then patch and deploy it to a lower environment, and only promote that exact tested version after verifying both application health and Falcon telemetry. This gives you a repeatable upgrade process and a clear audit trail without automatically deploying an untested sensor release.
+
+## Network requirements
+
+Yes. The CrowdStrike Falcon Container sensor communicates outbound to CrowdStrike's cloud (SaaS) to send telemetry, detections, and other security information. Your NGINX application can continue serving traffic while the sensor reports security activity to Falcon. The archived ECS Fargate guide explicitly describes this telemetry flow.
+
+GitHub
+
+For ECS Fargate, you may need to verify outbound connectivity, but you usually do not need a new inbound security-group rule.
+
+## 1. How the network traffic flows
+
+ECS Fargate task
+
+NGINX + Falcon sensor
+
+Outbound HTTPS — TCP 443
+
+Through NAT gateway or approved egress path
+
+CrowdStrike Falcon cloud (SaaS)
+
+Receives sensor telemetry and security events
+
+The sensor initiates outbound connections. It does not normally require CrowdStrike to initiate a new inbound connection to your task.
+
+## 2. Do you need to change the security group?
+
+It depends on how your Fargate task connects to the internet.
+
+| Existing network setup | What to do |
+| --- | --- |
+| Private subnet with NAT gateway and outbound HTTPS allowed | Usually no security-group change is required. |
+| Private subnet with restricted egress | Allow outbound TCP 443 to the approved CrowdStrike destinations through your egress controls. |
+| Private subnet without NAT or another permitted internet path | Configure an approved egress route or proxy. ECR VPC endpoints alone do not provide access to CrowdStrike SaaS. |
+| Public subnet with a public IP | Outbound connectivity may already work, but private subnets are generally preferable for application workloads. |
+
+AWS documents that private Fargate tasks can access the internet through a NAT gateway, or use VPC endpoints for supported AWS services. VPC endpoints do not automatically provide connectivity to third-party SaaS services.
+
+Amazon Elastic Container Service
+
++1
+
+### Example: existing security group
+
+If your task security group already has this outbound rule:
+
+hcl
+
+```
+egress {
+  from_port   = 0
+  to_port     = 0
+  protocol    = "-1"
+  cidr_blocks = ["0.0.0.0/0"]
+}
+```
+
+then outbound TCP 443 is already permitted by the security group. You may not need to change it.
+
+However, this rule permits all outbound IPv4 traffic, so it may be broader than your organization's security policy allows.
+
+### Example: restricted outbound access
+
+If your security policy requires explicit egress rules, a basic rule could look like this:
+
+hcl
+
+```
+egress {
+  description = "HTTPS egress for approved external services"
+  from_port   = 443
+  to_port     = 443
+  protocol    = "tcp"
+  cidr_blocks = var.approved_egress_cidrs
+}
+```
+
+Only use this if `approved_egress_cidrs` contains appropriate, maintained destination ranges for your egress design. Do not guess CrowdStrike IP addresses or assume that a single fixed CIDR covers all Falcon endpoints. If you use an HTTP proxy or AWS Network Firewall, enforce the approved destinations there instead.
+
+## 3. Which CrowdStrike domains should be allowed?
+
+The exact destinations depend on your Falcon cloud region, sensor version, and subscription. Obtain the current sensor network requirements and FQDNs from your CrowdStrike administrator or official documentation.
+
+For a restricted network, you should verify:
+
+- DNS resolution is working.
+- Outbound TCP 443 is permitted.
+- Your firewall or proxy permits the required CrowdStrike Falcon endpoints.
+- TLS inspection, if enabled, does not interfere with sensor communications.
+- Your egress logs show successful connections rather than blocked requests.
+
+Avoid allowing every external domain simply to make the sensor work.
+
+## 4\. How to test connectivity from ECS
+
+First, use ECS Exec to enter the running NGINX container:
+
+bash
+
+```
+aws ecs execute-command \
+  --cluster dev-cluster \
+  --task YOUR_TASK_ARN \
+  --container nginx \
+  --interactive \
+  --command "/bin/sh"
+```
+
+If the image contains `curl`, you can test DNS and HTTPS connectivity to an approved Falcon endpoint:
+
+sh
+
+```
+curl -Iv --connect-timeout 10 https://YOUR_APPROVED_FALCON_ENDPOINT/
+```
+
+A successful TLS connection confirms basic network reachability. An HTTP error response can still mean the network connection succeeded, so interpret the status code appropriately.
+
+If NGINX is a minimal image and does not contain `curl`, don't install diagnostic tools into your production application container just for testing. Instead, use an approved diagnostic task in the same subnets and security group, or inspect VPC Flow Logs and firewall logs.
+
+Finally, check the Falcon console for actual sensor telemetry. Network connectivity alone does not prove that the sensor has registered or is reporting successfully.
+
+My recommendation: If your Fargate tasks are already in private subnets with a NAT gateway and unrestricted outbound HTTPS, test first without changing the security group. If outbound access is restricted, add only the approved Falcon destinations to your existing egress controls—no new inbound rule should normally be necessary.****
+
+
+## 1. Can you test it entirely on your local machine?
+
+Yes, but there are two different kinds of testing.
+
+| Test | Can run locally? | What it proves |
+| --- | --- | --- |
+| Run the Falcon patching utility using Docker | Yes | The utility can read and modify your task-definition JSON. |
+| Run a patched NGINX container with Docker | Potentially, subject to sensor compatibility | The patched image/container startup works in your local Docker environment. |
+| Test the actual ECS Fargate deployment | No, not entirely locally | Confirms compatibility with ECS task definitions, Fargate, IAM, networking, and service deployment. |
+| Verify telemetry in Falcon SaaS | Requires a real sensor deployment with working connectivity | Confirms the sensor is communicating with CrowdStrike. |
+
+The linked CrowdStrike guide specifically documents running the patcher locally with Docker, but its sensor deployment target is ECS Fargate. The repository was archived in November 2024 and is explicitly unsupported.
+
+
+
+## 2. Local Docker test — step by step
+
+### Step 1: Check Docker and the Falcon image
+
+bash
+
+```
+docker info
+docker image ls
+```
+
+Make sure the Falcon image is already available locally under its full ECR image URI, for example:
+
+bash
+
+```
+export FALCON_IMAGE="123456789012.dkr.ecr.us-east-1.amazonaws.com/falcon-sensor:YOUR_TAG"
+docker image inspect "$FALCON_IMAGE"
+```
+
+Use the actual versioned tag you have approved.
+
+### Step 2: Create a simple NGINX task definition
+
+Create a file called `taskdefinition.json`:
+
+json
+
+```
+{
+  "family": "nginx-local-test",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "nginx",
+      "image": "nginx:stable",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Replace the account and role values with appropriate values for your environment. This is a task-definition specification for the patcher; it is not yet a running ECS task.
+
+### Step 3: Prepare the patcher's pull token
+
+The patcher may need to inspect private registry images to discover their entry points. For the private ECR Falcon image, generate a fresh token:
+
+bash
+
+```
+export AWS_REGION="us-east-1"
+export AWS_ACCOUNT_ID="123456789012"
+
+export PULL_TOKEN=$(
+  printf '{"auths":{"%s.dkr.ecr.%s.amazonaws.com":{"auth":"%s"}}}' \
+    "$AWS_ACCOUNT_ID" "$AWS_REGION" \
+    "$(printf 'AWS:%s' "$(aws ecr get-login-password \
+      --region "$AWS_REGION")" | base64 | tr -d '\n')" |
+  base64 | tr -d '\n'
+)
+```
+
+This assumes the Falcon image is in the specified account and region. If you use a different registry, adapt the authentication configuration.
+
+### Step 4: Run the patcher
+
+bash
+
+```
+export FALCON_CID="YOUR_CID_WITH_CHECKSUM"
+
+mkdir -p local-test
+
+cp taskdefinition.json local-test/taskdefinition.json
+
+docker run --rm --pull=never \
+  -v "$PWD/local-test:/var/run/spec" \
+  "$FALCON_IMAGE" \
+  -cid "$FALCON_CID" \
+  -image "$FALCON_IMAGE" \
+  -pulltoken "$PULL_TOKEN" \
+  -ecs-spec-file /var/run/spec/taskdefinition.json \
+  > local-test/taskdefinitionwithfalcon.json
+
+unset PULL_TOKEN
+```
+
+If the patcher exits successfully, inspect the output:
+
+bash
+
+```
+jq '.containerDefinitions[] | {
+  name,
+  image,
+  entryPoint,
+  command,
+  linuxParameters,
+  mountPoints,
+  dependsOn
+}' local-test/taskdefinitionwithfalcon.json
+```
+
+Compare the original and patched JSON:
+
+bash
+
+```
+diff -u \
+  local-test/taskdefinition.json \
+  local-test/taskdefinitionwithfalcon.json
+```
+
+You should see the expected sensor initialization, shared-volume, entry-point, and capability changes for the version of the patcher you are using. The documented patcher adds `SYS_PTRACE` and injects the sensor into the application containers.
+
+GitHub
+
+### Step 5: Can you run the patched task definition directly with Docker?
+
+Not directly. Docker does not run an ECS task definition JSON as if it were a Docker Compose file. The task definition includes ECS-specific fields such as IAM roles, Fargate networking, and task-level CPU and memory.
+
+You can test the NGINX image independently:
+
+bash
+
+```
+docker run --rm -d \
+  --name nginx-local-test \
+  -p 8080:80 \
+  nginx:stable
+
+curl -I http://localhost:8080
+
+docker rm -f nginx-local-test
+```
+
+This only verifies that NGINX runs normally. It does not verify that Falcon was injected or that the Falcon sensor can report telemetry.
+
+For a real end-to-end test, deploy the patched task definition to a development ECS Fargate service, then verify the running container and Falcon console.
+
+## 3. Recommended testing strategy
+
+- Local Docker: validate the patcher, JSON changes, and baseline NGINX behavior.
+- Development ECS Fargate: validate sensor initialization, container startup, networking, and task health.
+- Falcon SaaS: confirm that telemetry arrives and the sensor is healthy.
+
+That separation makes it much easier to identify whether a failure comes from the patcher, the application container, the ECS environment, or Falcon connectivity.
+
+
+
