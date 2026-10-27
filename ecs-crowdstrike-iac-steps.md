@@ -999,3 +999,427 @@ Check all three outcomes:
 - Keep the Falcon image version pinned and validate the module's current version and compatibility before using it in production.
 - If your existing task definition has additional containers, secrets, volumes, environment variables, or custom logging, migrate those settings into the module configuration as well. Otherwise, replacing the task definition could remove them.
 
+## Using manual custom script
+
+Below is a single interactive Bash script for testing CrowdStrike's archived ECS Fargate patching workflow against an existing NGINX service. It runs locally using Docker, backs up the current task definition, shows the proposed changes, and requires two separate deployment approvals.
+
+Safety note: The script does not modify your ECS service until you approve the registration and service update. Because the CrowdStrike repository is archived and unsupported, use a disposable development service first. The local Falcon image must contain the repository's expected patcher and support its documented CLI arguments.
+
+## Save as `install-crowdstrike-ecs.sh`
+
+This version assumes the Falcon image is already present locally under the same ECR URI you enter, and that the application images are accessible through ECR or public registries. It builds the ECR pull token for private ECR images referenced by the task definition.
+
+bash
+
+```
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+# CrowdStrike ECS Fargate task-definition patcher test.
+# Use a non-production ECS service first.
+# Requires: AWS CLI v2, Docker, jq, diff, base64.
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+confirm() {
+  local answer
+  echo
+  read -r -p "$1 Type YES to continue: " answer
+  [[ "$answer" == "YES" ]]
+}
+
+echo "=============================================="
+echo " CrowdStrike ECS Fargate patcher - test only"
+echo "=============================================="
+echo "This modifies an ECS service only after approval."
+echo "A timestamped backup will be retained locally."
+echo
+
+# 1. Prerequisites
+for cmd in aws docker jq diff base64; do
+  command -v "$cmd" >/dev/null 2>&1 ||
+    die "Missing prerequisite: $cmd"
+done
+
+aws --version | grep -q 'aws-cli/2' ||
+  die "AWS CLI v2 is required."
+
+docker info >/dev/null 2>&1 ||
+  die "Docker daemon is unavailable. Start Docker and retry."
+
+# 2. Prompt for inputs
+read -r -p "AWS region (e.g. us-east-1): " AWS_REGION
+read -r -p "ECS cluster name or ARN: " ECS_CLUSTER
+read -r -p "ECS service name or ARN: " ECS_SERVICE
+read -r -p "Falcon CID (including checksum): " FALCON_CID
+read -r -p "Falcon image ECR URI (with pinned tag): " FALCON_IMAGE_URI
+
+[[ -n "$AWS_REGION" ]] || die "Region is required."
+[[ -n "$ECS_CLUSTER" ]] || die "Cluster is required."
+[[ -n "$ECS_SERVICE" ]] || die "Service is required."
+[[ -n "$FALCON_CID" ]] || die "Falcon CID is required."
+[[ -n "$FALCON_IMAGE_URI" ]] || die "Falcon image URI is required."
+
+[[ "$FALCON_CID" != *" "* ]] ||
+  die "CID must not contain spaces."
+
+# Require a standard private ECR URI with a tag.
+if [[ ! "$FALCON_IMAGE_URI" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+:[^/:]+$ ]]; then
+  die "Falcon image must be a tagged private ECR URI."
+fi
+
+FALCON_REGISTRY="${FALCON_IMAGE_URI%%/*}"
+
+echo
+echo "Checking AWS identity..."
+aws sts get-caller-identity --region "$AWS_REGION" ||
+  die "Unable to authenticate to AWS."
+
+echo
+echo "Checking local Falcon image..."
+docker image inspect "$FALCON_IMAGE_URI" >/dev/null 2>&1 ||
+  die "Falcon image is not available locally under that exact URI. Pull or tag it first."
+
+echo "Local Falcon image is available."
+
+# Create a persistent, private backup directory.
+STAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="./ecs-falcon-backup-${STAMP}"
+mkdir -m 700 "$BACKUP_DIR"
+
+echo "Backup directory: $BACKUP_DIR"
+
+# 3. Retrieve existing service and task definition
+echo
+echo "Retrieving ECS service..."
+
+SERVICE_JSON=$(aws ecs describe-services \
+  --cluster "$ECS_CLUSTER" \
+  --services "$ECS_SERVICE" \
+  --region "$AWS_REGION" \
+  --output json) ||
+  die "Could not describe ECS service."
+
+SERVICE_COUNT=$(jq '.services | length' <<<"$SERVICE_JSON")
+[[ "$SERVICE_COUNT" == "1" ]] ||
+  die "Service not found or multiple service matches returned."
+
+SERVICE_STATUS=$(jq -r '.services[0].status' <<<"$SERVICE_JSON")
+[[ "$SERVICE_STATUS" == "ACTIVE" ]] ||
+  die "Service is not ACTIVE: $SERVICE_STATUS"
+
+CURRENT_TASK_ARN=$(jq -r '.services[0].taskDefinition' <<<"$SERVICE_JSON")
+[[ -n "$CURRENT_TASK_ARN" && "$CURRENT_TASK_ARN" != "null" ]] ||
+  die "Service has no task definition."
+
+echo "Current task definition: $CURRENT_TASK_ARN"
+
+aws ecs describe-task-definition \
+  --task-definition "$CURRENT_TASK_ARN" \
+  --region "$AWS_REGION" \
+  --output json |
+jq '.taskDefinition' > "$BACKUP_DIR/original-full.json"
+
+# 4. Remove AWS-generated fields that cannot be registered again.
+jq 'del(
+  .taskDefinitionArn,
+  .requiresAttributes,
+  .status,
+  .revision,
+  .compatibilities,
+  .registeredAt,
+  .registeredBy,
+  .deregisteredAt,
+  .tags
+)' "$BACKUP_DIR/original-full.json" \
+  > "$BACKUP_DIR/taskdefinition.json"
+
+jq -e '
+  (.family | type == "string") and
+  (.containerDefinitions | type == "array" and length > 0) and
+  (.requiresCompatibilities | index("FARGATE") != null)
+' "$BACKUP_DIR/taskdefinition.json" >/dev/null ||
+  die "Task definition is not a valid Fargate task definition."
+
+# Verify that this is an NGINX service.
+if ! jq -e '
+  any(.containerDefinitions[];
+    ((.name // "") + " " + (.image // "") | ascii_downcase)
+    | contains("nginx"))
+' "$BACKUP_DIR/taskdefinition.json" >/dev/null; then
+  die "No NGINX container name or image found. Refusing to modify this service."
+fi
+
+# Refuse to patch a definition already containing the Falcon init container.
+if jq -e '
+  any(.containerDefinitions[];
+    .name == "crowdstrike-falcon-init-container")
+' "$BACKUP_DIR/taskdefinition.json" >/dev/null; then
+  die "Falcon init container already exists. Refusing to inject it twice."
+fi
+
+echo
+echo "Original task definition saved."
+echo "Checking ECR image authentication..."
+
+# 5. Build Docker config auth for ECR registries referenced by
+# the task definition and Falcon image. The resulting token is
+# passed only to the patcher and is not written to disk.
+AUTH_CONFIG='{"auths":{}}'
+
+mapfile -t ECR_REGISTRIES < <(
+  {
+    printf '%s\n' "$FALCON_IMAGE_URI"
+    jq -r '.containerDefinitions[].image' \
+      "$BACKUP_DIR/taskdefinition.json"
+  } |
+  while IFS= read -r image; do
+    registry="${image%%/*}"
+    if [[ "$registry" =~ ^[0-9]{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$ ]]; then
+      printf '%s\n' "$registry"
+    fi
+  done |
+  sort -u
+)
+
+((${#ECR_REGISTRIES[@]} > 0)) ||
+  die "No private ECR registries found."
+
+for registry in "${ECR_REGISTRIES[@]}"; do
+  registry_region="${registry#*.dkr.ecr.}"
+  registry_region="${registry_region%.amazonaws.com}"
+
+  echo "Obtaining ECR authorization for $registry"
+
+  PASSWORD=$(aws ecr get-login-password \
+    --region "$registry_region") ||
+    die "Cannot obtain ECR credentials for $registry"
+
+  AUTH=$(printf 'AWS:%s' "$PASSWORD" |
+    base64 | tr -d '\r\n')
+  unset PASSWORD
+
+  AUTH_CONFIG=$(jq -c \
+    --arg registry "$registry" \
+    --arg auth "$AUTH" \
+    '.auths[$registry] = {"auth": $auth}' \
+    <<<"$AUTH_CONFIG")
+
+  unset AUTH
+done
+
+PULL_TOKEN=$(printf '%s' "$AUTH_CONFIG" |
+  base64 | tr -d '\r\n')
+unset AUTH_CONFIG
+
+# 6. Run patcher using the locally available Falcon image.
+echo
+echo "Running CrowdStrike patcher..."
+
+if ! docker run --rm --pull=never \
+  -v "$PWD/$BACKUP_DIR:/var/run/spec" \
+  "$FALCON_IMAGE_URI" \
+  -cid "$FALCON_CID" \
+  -image "$FALCON_IMAGE_URI" \
+  -pulltoken "$PULL_TOKEN" \
+  -ecs-spec-file /var/run/spec/taskdefinition.json \
+  > "$BACKUP_DIR/taskdefinitionwithfalcon.json"; then
+  unset PULL_TOKEN
+  die "CrowdStrike patcher failed. Original definition is preserved."
+fi
+
+unset PULL_TOKEN
+
+PATCHED="$BACKUP_DIR/taskdefinitionwithfalcon.json"
+
+# 7. Validate patched JSON
+jq -e '
+  (.family | type == "string") and
+  (.containerDefinitions | type == "array" and length > 0) and
+  (.requiresCompatibilities | index("FARGATE") != null) and
+  any(.containerDefinitions[];
+    .name == "crowdstrike-falcon-init-container")
+' "$PATCHED" >/dev/null ||
+  die "Patched JSON is invalid or Falcon init container is missing."
+
+jq -e '
+  all(.containerDefinitions[];
+    ((.linuxParameters.capabilities.add // []) | index("SYS_PTRACE")) != null
+  )
+' "$PATCHED" >/dev/null ||
+  die "SYS_PTRACE is not present on every patched container."
+
+if jq -e '
+  any(.containerDefinitions[];
+    ((.name // "") + " " + (.image // "") | ascii_downcase)
+    | contains("nginx"))
+' "$PATCHED" >/dev/null; then
+  echo "NGINX container found in patched definition."
+else
+  die "NGINX container missing from patched definition."
+fi
+
+echo
+echo "Patched task definition validated."
+echo "Review the full diff below:"
+echo
+
+diff -u \
+  "$BACKUP_DIR/taskdefinition.json" \
+  "$PATCHED" || true
+
+echo
+echo "Backup files:"
+echo "  Original full: $BACKUP_DIR/original-full.json"
+echo "  Clean input:   $BACKUP_DIR/taskdefinition.json"
+echo "  Patched JSON:  $PATCHED"
+
+# 8. Explicit approval before registering the new revision.
+echo
+echo "Cluster: $ECS_CLUSTER"
+echo "Service: $ECS_SERVICE"
+echo "Current task definition: $CURRENT_TASK_ARN"
+echo "Falcon image: $FALCON_IMAGE_URI"
+
+confirm "Register the patched task definition?" ||
+  die "Registration cancelled. ECS was not changed."
+
+NEW_TASK_ARN=$(aws ecs register-task-definition \
+  --cli-input-json "file://$PATCHED" \
+  --region "$AWS_REGION" \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text) ||
+  die "Task definition registration failed."
+
+echo
+echo "Registered new task definition:"
+echo "$NEW_TASK_ARN"
+
+# 9. Explicit approval before changing the service.
+if ! confirm "Update the ECS service to use this new revision?"; then
+  echo "Service was not updated."
+  echo "Registered revision remains available: $NEW_TASK_ARN"
+  exit 0
+fi
+
+# Re-check that the service still points to the original revision.
+LATEST_TASK_ARN=$(aws ecs describe-services \
+  --cluster "$ECS_CLUSTER" \
+  --services "$ECS_SERVICE" \
+  --region "$AWS_REGION" \
+  --query 'services[0].taskDefinition' \
+  --output text)
+
+[[ "$LATEST_TASK_ARN" == "$CURRENT_TASK_ARN" ]] ||
+  die "Service task definition changed since inspection. Refusing to overwrite it."
+
+aws ecs update-service \
+  --cluster "$ECS_CLUSTER" \
+  --service "$ECS_SERVICE" \
+  --task-definition "$NEW_TASK_ARN" \
+  --region "$AWS_REGION" >/dev/null ||
+  die "ECS service update failed."
+
+# 10. Wait for stability and validate running NGINX task.
+echo
+echo "Waiting for ECS service stability..."
+
+aws ecs wait services-stable \
+  --cluster "$ECS_CLUSTER" \
+  --services "$ECS_SERVICE" \
+  --region "$AWS_REGION" ||
+  die "Service did not stabilize. Check ECS events and stopped task reasons."
+
+FINAL_SERVICE=$(aws ecs describe-services \
+  --cluster "$ECS_CLUSTER" \
+  --services "$ECS_SERVICE" \
+  --region "$AWS_REGION" \
+  --output json)
+
+FINAL_TASK_ARN=$(jq -r '.services[0].taskDefinition' <<<"$FINAL_SERVICE")
+RUNNING=$(jq -r '.services[0].runningCount' <<<"$FINAL_SERVICE")
+DESIRED=$(jq -r '.services[0].desiredCount' <<<"$FINAL_SERVICE")
+
+[[ "$FINAL_TASK_ARN" == "$NEW_TASK_ARN" ]] ||
+  die "Service is not using the registered Falcon task definition."
+
+[[ "$RUNNING" -gt 0 && "$RUNNING" == "$DESIRED" ]] ||
+  die "Service running count does not match desired count."
+
+mapfile -t TASK_ARNS < <(
+  aws ecs list-tasks \
+    --cluster "$ECS_CLUSTER" \
+    --service-name "$ECS_SERVICE" \
+    --desired-status RUNNING \
+    --region "$AWS_REGION" \
+    --query 'taskArns[]' \
+    --output text |
+  tr '\t' '\n' |
+  grep '^arn:' || true
+)
+
+((${#TASK_ARNS[@]} > 0)) ||
+  die "No running service tasks found."
+
+TASK_JSON=$(aws ecs describe-tasks \
+  --cluster "$ECS_CLUSTER" \
+  --tasks "${TASK_ARNS[@]}" \
+  --region "$AWS_REGION" \
+  --output json)
+
+jq -e '
+  (.failures | length) == 0 and
+  any(.tasks[];
+    .lastStatus == "RUNNING" and
+    any(.containers[];
+      ((.name // "") + " " + (.image // "") | ascii_downcase)
+      | contains("nginx")
+    ) and
+    any(.containers[];
+      .name == "crowdstrike-falcon-init-container"
+    )
+  )
+' <<<"$TASK_JSON" >/dev/null ||
+  die "Running task validation failed. Inspect task containers and ECS events."
+
+echo
+echo "=============================================="
+echo " SUCCESS: ECS Fargate test deployment"
+echo "=============================================="
+echo "Cluster:          $ECS_CLUSTER"
+echo "Service:          $ECS_SERVICE"
+echo "Task definition:   $NEW_TASK_ARN"
+echo "Running tasks:     $RUNNING / $DESIRED"
+echo "Backup directory:  $BACKUP_DIR"
+echo
+echo "Confirm sensor health and telemetry in Falcon."
+echo "ECS stability alone does not prove sensor reporting."
+```
+
+## Run it
+
+Save the script, then execute:
+
+bash
+
+```
+chmod 700 install-crowdstrike-ecs.sh
+./install-crowdstrike-ecs.sh
+```
+
+Before approving deployment, review the generated diff. The patcher should add the `crowdstrike-falcon-init-container`, adjust application container entry points, and add `SYS_PTRACE`. 
+
+
+### Important limitations
+
+- This script handles private ECR registries in the standard AWS commercial partition. It assumes the current AWS identity has permission to pull every private ECR image referenced in the task definition.
+- The Falcon image must be tagged locally with exactly the ECR URI you enter. `--pull=never` prevents Docker from silently downloading a different image.
+- If NGINX uses a custom command or entrypoint, inspect the patched JSON carefully before approval.
+- If deployment fails, inspect ECS service events and stopped-task reasons. A successful registration does not guarantee that Fargate can start the patched task.
+- The script intentionally leaves the registered revision in place if you decline the second approval. It does not automatically roll back a deployment after an application or sensor health failure.
+- The final validation confirms ECS container state, not successful Falcon telemetry. Check the Falcon console to verify the sensor is actually reporting.
