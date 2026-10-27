@@ -1,6 +1,97 @@
 # CrowdStrike Falcon Container Security for AWS ECS — Manual Installation Guide
 
-I reviewed the [CrowdStrike Container-Security GitHub repository](<https://github.com/CrowdStrike/Container-Security?utm_source=chatgpt.com>), focusing on its AWS ECS Fargate implementation.
+## 3\. The simple manual process
+
+Since your CDK deployment already works, you do not need to change CDK initially. Use the existing NGINX image and manually create a CrowdStrike-enabled revision of the ECS task definition.
+
+### Step 1 — Export the current task definition
+
+In AWS Console:
+
+1. Open ECS → Task definitions.
+2. Select the task definition used by your NGINX service.
+3. Download or copy its JSON definition.
+
+Alternatively, use the AWS CLI:
+
+bash
+
+```
+aws ecs describe-task-definition \
+  --task-definition YOUR_TASK_FAMILY \
+  --query taskDefinition \
+  --output json > taskdefinition.json
+```
+
+Remove AWS-generated fields such as `taskDefinitionArn`, `revision`, `status`, `requiresAttributes`, `compatibilities`, `registeredAt` and `registeredBy` before re-registering it.
+
+Validate: Confirm the JSON contains your existing NGINX image URI and the correct task configuration.
+
+### Step 2 — Run the CrowdStrike patcher
+
+Follow the [CrowdStrike ECS Fargate guide](<https://github.com/CrowdStrike/Container-Security/blob/main/aws-ecs/ecs-fargate-guide.md?utm_source=chatgpt.com>) to authenticate to the CrowdStrike registry and obtain the Falcon sensor image.
+
+Since you already have the Falcon sensor image in ECR, use that image to run the patcher:
+
+bash
+
+```
+docker run --rm \
+  -v "$PWD:/var/run/spec" \
+  YOUR_ECR_FALCON_IMAGE_URI \
+  -cid "YOUR_FALCON_CID" \
+  -image YOUR_ECR_FALCON_IMAGE_URI \
+  -pulltoken "$PULL_TOKEN" \
+  -ecs-spec-file /var/run/spec/taskdefinition.json \
+  > taskdefinitionwithfalcon.json
+```
+
+Replace the placeholders with your actual values. `$PULL_TOKEN` must be a valid ECR pull token in the format expected by the patcher; the patcher needs to inspect private application images if their entry points are not explicitly specified.
+
+Validate: Inspect `taskdefinitionwithfalcon.json` and verify that the NGINX image is preserved and the CrowdStrike initialization and sensor configuration have been added.
+
+### Step 3 — Register the patched revision
+
+bash
+
+```
+aws ecs register-task-definition \
+  --cli-input-json file://taskdefinitionwithfalcon.json
+```
+
+Validate: Record the new task-definition ARN returned by AWS.
+
+### Step 4 — Update the ECS service
+
+Update your existing service to use the new revision:
+
+bash
+
+```
+aws ecs update-service \
+  --cluster YOUR_CLUSTER \
+  --service YOUR_SERVICE \
+  --task-definition YOUR_NEW_TASK_DEFINITION_ARN
+```
+
+Validate: Wait for the service to reach steady state, confirm the new tasks are healthy, and verify NGINX responds.
+
+### Step 5 — Verify CrowdStrike
+
+Check the ECS task and container logs, then confirm the expected sensor telemetry appears in your Falcon console. A healthy ECS task alone does not prove that the sensor is operating.
+
+## 4\. Important CDK consideration
+
+Your CDK stack still defines the original task definition. That means a later `cdk deploy` can create a new revision without the manual CrowdStrike changes and move the service back to that definition.
+
+For now, you can keep the manual process as a proof of concept. Before making it a permanent production workflow, choose one of these approaches:
+
+- Manual: Reapply the patch after each CDK deployment.
+- Automated later: Add a pipeline step that patches the task definition and deploys the patched revision.
+- CDK-integrated: Update the CDK-generated task definition or CloudFormation template before deployment.
+
+The referenced repository is archived and unsupported, so validate this workflow with your current CrowdStrike guidance before production use.
+-------------------------------------
 
 The repository contains an ECS Fargate guide that explains how to add the CrowdStrike Falcon Container sensor to an existing application task definition, deploy the updated task, and verify that the sensor is running. Important: the repository was archived on November 22, 2024, and its authors state that it is a community project, not an officially supported CrowdStrike product. Treat it as a reference and confirm the current installation procedure with your CrowdStrike documentation before production deployment.
 
