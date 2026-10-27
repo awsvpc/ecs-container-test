@@ -1418,3 +1418,425 @@ Your existing `output.tf`, `iam.tf`, `ecr.tf`, `provider.tf`, Dockerfile, and Ng
 
 Important: Because the ALB is internal, access `application_url` from a machine connected to the VPC, such as through VPN, Direct Connect, or a bastion host. Ensure the private subnets have ECR and CloudWatch connectivity through NAT or the required VPC endpoints; otherwise, image pulls or log delivery may fail.
 
+## Datadog and Splunk sidecar 
+
+We'll extend your existing Terraform deployment with Datadog APM and Splunk log forwarding, keeping the existing VPC, private subnets, internal ALB, ECR repository, and ECS Fargate service.
+
+One important ECS detail: Fargate sidecars share the task's network namespace, but they do not automatically share the application's filesystem. We'll configure log forwarding explicitly rather than assume a sidecar can read the Nginx container's log files.
+
+## Proposed architecture
+
+Internal Application Load Balancer
+
+Private subnets · HTTP :80
+
+### ECS Fargate task
+
+Nginx + Python application
+
+HTTP :80 · Python :8000 · APM instrumentation
+
+Datadog Agent
+
+APM traces, service metrics, health
+
+Splunk logging
+
+Container stdout/stderr forwarding
+
+Datadog
+
+APM intake
+
+Splunk HEC
+
+Log ingestion endpoint
+
+There are two distinct integrations:
+
+- Datadog APM: add the Datadog Agent sidecar and instrument the Python application with `ddtrace`. Merely running the Agent does not generate application traces.
+- Splunk logs: use the ECS `awsfirelens` log driver with Fluent Bit as a log-router sidecar, forwarding container stdout/stderr to Splunk HTTP Event Collector (HEC). This is generally more reliable than making a sidecar try to read another container's log files.
+
+## Terraform changes
+
+The following updates keep the Datadog API key and Splunk HEC token in AWS Secrets Manager rather than hardcoding credentials in Terraform. Datadog's ECS guidance supports running the Agent as a Fargate sidecar, and AWS FireLens supports forwarding container logs to third-party destinations.
+
+Datadog
+
++2
+
+The updated deployment uses three containers in each task:
+
+- `nginx-demo-container`: Nginx and Python application, instrumented with `ddtrace`.
+- `datadog-agent`: receives APM traces and reports Fargate telemetry.
+- `log_router`: Fluent Bit FireLens sidecar that sends application logs to Splunk HEC.
+
+Only the files that need changes are included below.
+
+## 1. `variables.tf`
+
+Add these variables to your existing file.
+
+hcl
+
+```
+
+variable "datadog_api_key_secret_arn" {
+  description = "Secrets Manager ARN containing the Datadog API key"
+  type        = string
+  sensitive   = true
+}
+
+variable "datadog_site" {
+  description = "Datadog site, for example datadoghq.com"
+  type        = string
+  default     = "datadoghq.com"
+}
+
+variable "datadog_env" {
+  description = "Datadog environment tag"
+  type        = string
+  default     = "dev"
+}
+
+variable "splunk_hec_host" {
+  description = "Splunk HEC hostname without scheme or path"
+  type        = string
+}
+
+variable "splunk_hec_port" {
+  description = "Splunk HEC port"
+  type        = number
+  default     = 8088
+}
+
+variable "splunk_hec_token_secret_arn" {
+  description = "Secrets Manager ARN containing the Splunk HEC token"
+  type        = string
+  sensitive   = true
+}
+```
+
+## 2. `iam.tf`
+
+Add this policy and attachment to the existing IAM configuration. The execution role needs permission to retrieve the two secrets when ECS starts the containers.
+
+hcl
+
+```
+
+resource "aws_iam_role_policy" "observability_secrets" {
+  name = "${var.project_name}-observability-secrets"
+  role = aws_iam_role.ecs_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          var.datadog_api_key_secret_arn,
+          var.splunk_hec_token_secret_arn
+        ]
+      }
+    ]
+  })
+}
+```
+
+If either secret uses a customer-managed KMS key, also grant the execution role `kms:Decrypt` on that specific key.
+
+## 3. `ecs.tf`
+
+Replace the existing `aws_ecs_task_definition.app` resource with this version. Keep your existing CloudWatch log group, ECS cluster, and ECS service resources. The service still uses your existing private subnet IDs and security groups.
+
+hcl
+
+```
+
+resource "aws_ecs_task_definition" "app" {
+  family                   = "${var.project_name}-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+
+  # Increase resources to accommodate the application and both sidecars.
+  cpu    = 512
+  memory = 1024
+
+  execution_role_arn = aws_iam_role.ecs_execution.arn
+  task_role_arn      = aws_iam_role.ecs_task.arn
+
+  container_definitions = jsonencode([
+    # Application container: Nginx + Python + ddtrace.
+    {
+      name      = "${var.project_name}-container"
+      image     = docker_registry_image.app.name
+      essential = true
+
+      portMappings = [
+        {
+          name          = "http"
+          containerPort = var.container_port
+          hostPort      = var.container_port
+          protocol      = "tcp"
+        }
+      ]
+
+      environment = [
+        { name = "DD_SERVICE", value = var.project_name },
+        { name = "DD_ENV", value = var.datadog_env },
+        { name = "DD_VERSION", value = var.image_tag },
+        { name = "DD_TRACE_ENABLED", value = "true" },
+        { name = "DD_AGENT_HOST", value = "127.0.0.1" },
+        { name = "DD_TRACE_AGENT_PORT", value = "8126" },
+        { name = "DD_LOGS_INJECTION", value = "true" }
+      ]
+
+      dependsOn = [
+        {
+          containerName = "datadog-agent"
+          condition     = "START"
+        },
+        {
+          containerName = "log_router"
+          condition     = "START"
+        }
+      ]
+
+      healthCheck = {
+        command = [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1/health', timeout=3)\" || exit 1"
+        ]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 20
+      }
+
+      logConfiguration = {
+        logDriver = "awsfirelens"
+        options = {
+          Name            = "splunk"
+          Host            = var.splunk_hec_host
+          Port            = tostring(var.splunk_hec_port)
+          TLS             = "On"
+          "TLS.Verify"    = "On"
+          Splunk_Send_Raw = "On"
+          Splunk_Source   = var.project_name
+          Splunk_Sourcetype = "nginx:python"
+        }
+
+        secretOptions = [
+          {
+            name      = "Splunk_Token"
+            valueFrom = var.splunk_hec_token_secret_arn
+          }
+        ]
+      }
+    },
+
+    # Datadog Agent: APM and Fargate telemetry.
+    {
+      name      = "datadog-agent"
+      image     = "public.ecr.aws/datadog/agent:7"
+      essential = true
+
+      environment = [
+        { name = "ECS_FARGATE", value = "true" },
+        { name = "DD_SITE", value = var.datadog_site },
+        { name = "DD_ENV", value = var.datadog_env },
+        { name = "DD_SERVICE", value = var.project_name },
+        { name = "DD_APM_ENABLED", value = "true" },
+        { name = "DD_APM_NON_LOCAL_TRAFFIC", value = "true" },
+        { name = "DD_LOGS_ENABLED", value = "false" }
+      ]
+
+      secrets = [
+        {
+          name      = "DD_API_KEY"
+          valueFrom = var.datadog_api_key_secret_arn
+        }
+      ]
+
+      portMappings = [
+        {
+          containerPort = 8126
+          hostPort      = 8126
+          protocol      = "tcp"
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.app.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "datadog"
+        }
+      }
+    },
+
+    # FireLens Fluent Bit sidecar: forwards app logs to Splunk HEC.
+    {
+      name      = "log_router"
+      image     = "public.ecr.aws/aws-observability/aws-for-fluent-bit:stable"
+      essential = true
+      memoryReservation = 64
+
+      firelensConfiguration = {
+        type = "fluentbit"
+        options = {
+          "enable-ecs-log-metadata" = "true"
+        }
+      }
+
+      # Keep the router's own diagnostic logs in CloudWatch.
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.app.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "log-router"
+        }
+      }
+    }
+  ])
+
+  tags = local.common_tags
+
+  depends_on = [
+    aws_iam_role_policy_attachment.ecs_execution,
+    aws_iam_role_policy.observability_secrets,
+    docker_registry_image.app
+  ]
+}
+```
+
+The `aws_ecs_service.app` resource can remain unchanged. However, increase its task definition resources consistently by keeping the task definition at 512 CPU units and 1,024 MiB of memory. This is a valid Fargate size.
+
+## 4. `Dockerfile`
+
+Update the image so Python tracing is installed and launched through `ddtrace-run`. Keep the Debian Trixie/Python 3.12 base image.
+
+dockerfile
+
+```
+
+FROM python:3.12-slim-trixie
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/nginx/sites-enabled/default
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY app.py /app/app.py
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+CMD ["sh", "-c", "ddtrace-run python /app/app.py & exec nginx -g 'daemon off;'"]
+```
+
+## 5. `requirements.txt`
+
+text
+
+```
+
+ddtrace>=2.0,<4.0
+```
+
+## 6. `nginx.conf`
+
+Send Nginx access and error logs to standard output and standard error. ECS FireLens collects the container's stdout/stderr streams and forwards them to Splunk.
+
+nginx
+
+```
+
+server {
+    listen 80;
+    server_name _;
+
+    access_log /dev/stdout;
+    error_log /dev/stderr warn;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    }
+
+    location = /health {
+        proxy_pass http://127.0.0.1:8000/health;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+## 7. `terraform.tfvars`
+
+Add your observability configuration. Create the two secrets in AWS Secrets Manager beforehand; each secret should contain the raw API key or token as its `SecretString`.
+
+hcl
+
+```
+
+datadog_api_key_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:datadog-api-key-xxxxxx"
+
+datadog_site = "datadoghq.com"
+datadog_env  = "dev"
+
+splunk_hec_host = "splunk-hec.example.com"
+splunk_hec_port = 8088
+
+splunk_hec_token_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:splunk-hec-token-xxxxxx"
+```
+
+Use your actual Datadog site and Splunk HEC hostname. The Splunk hostname should not include `https://` or a path.
+
+## 8. Deploy and verify
+
+bash
+
+```
+terraform fmt -recursive
+terraform validate
+terraform plan
+terraform apply
+```
+
+After the ECS service stabilizes:
+
+- Datadog APM: filter the APM Services page by the service name in `project_name`, with the environment set by `datadog_env`.
+- Splunk logs: search the configured index for the `nginx:python` sourcetype, or search all indexes for events with the application source.
+- CloudWatch: inspect `/ecs/nginx-demo` for Datadog Agent and log-router diagnostics.
+
+### Important networking and security notes
+
+- Private subnets must have outbound connectivity to the Datadog intake and Splunk HEC endpoints over HTTPS. NAT or appropriately configured egress infrastructure is required unless you have another permitted route.
+- Datadog APM uses port 8126 within the task's shared network namespace. No public APM ingress rule is needed.
+- The Splunk HEC endpoint must accept TLS connections and have HEC enabled.
+- This configuration forwards application container logs to Splunk. The Datadog Agent and Fluent Bit diagnostic logs remain in CloudWatch.
+- Do not set `DD_API_KEY` or `Splunk_Token` as ordinary environment variables or commit credentials to source control.
+
+One final consideration: this configuration requires enough Fargate CPU and memory for all three containers. If the application is very lightweight, 512 CPU units and 1 GiB may work for testing, but increase the allocation if the Datadog Agent or log router experiences memory pressure.
+
+
